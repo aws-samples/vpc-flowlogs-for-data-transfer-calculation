@@ -64,6 +64,7 @@ To avoid ongoing charges, delete the resources you created. Go to the AWS Manage
 
 ## Contributors
 Shiva Vaidyanathan - vaidys@amazon.com
+
 Stan Fan - fanhongy@amazon.com
 
 ## Security
