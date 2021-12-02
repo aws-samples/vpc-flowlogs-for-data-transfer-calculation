@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  pLambdaFunctionS3Buket:
+    Type: String
+    Description: S3 bucket that contains your data transfer calculator lambda function 
+
+  pSpokeAccount:
+    Type: String
+    Description: the Spoke account ID
+
+    
+Conditions:
+  cCrossAccount: !Not [!Equals [!Ref pSpokeAccount, ""]]
+
+Resources:  
+  #################################################
+  ## Dynamodb Table with Subnet CIDR AZ mappings ##
+  #################################################
+  rDynamoDBTable: 
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - AttributeName: "AvailabilityZoneId"
+          AttributeType: "S"
+        - AttributeName: "CidrBlock"
+          AttributeType: "S"
+        - AttributeName: "SubnetId"
+          AttributeType: "S"
+      KeySchema: 
+        - AttributeName: "SubnetId"
+          KeyType: "HASH"
+        - AttributeName: "CidrBlock"
+          KeyType: "RANGE"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      GlobalSecondaryIndexes: 
+        - 
+          IndexName: "AvailabilityZoneId"
+          KeySchema: 
+            - 
+              AttributeName: "AvailabilityZoneId"
+              KeyType: "HASH"
+          Projection: 
+            ProjectionType: "KEYS_ONLY"
+          ProvisionedThroughput: 
+            ReadCapacityUnits: "5"
+            WriteCapacityUnits: "5"
+      TableName: "AZsMapping"
+      
+  rDDBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Ref pSpokeAccount
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: ddballowall
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 
+            - 'dynamodb:*'
+            Resource: "*"
+          - Effect: Allow
+            Action: 
+            - 's3:CreateBucket'
+            - 's3:DeleteBucket'
+            - 's3:DeleteBucket*'
+            - 's3:PutBucket*'
+            Resource: "*"
+
+  #############################################
+  ## Calculate the Byte sum. Triggered Daily ##
+  #############################################
+  
+  rReceiverKinesis:
+    Type: "AWS::Kinesis::Stream"
+    Properties: 
+      ShardCount: 1
+      Name: RecipientStream
+  
+  rCWLtoKinesisRole: 
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: PermissionForCWL
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 
+            - 'kinesis:PutRecord'
+            Resource: !GetAtt rReceiverKinesis.Arn
+              
+  rVpcFlowLogDst:
+    Type: "AWS::Logs::Destination"
+    Properties:
+      DestinationName: VPCFlowLogDst
+      RoleArn: !GetAtt rCWLtoKinesisRole.Arn
+      TargetArn: !GetAtt rReceiverKinesis.Arn
+      DestinationPolicy: !Sub  "{\"Version\" : \"2012-10-17\",\"Statement\" : [{\"Effect\" : \"Allow\", \"Principal\" : {\"AWS\" : \"${pSpokeAccount}\"},\"Action\" : \"logs:PutSubscriptionFilter\", \"Resource\" : \"arn:aws:logs:${AWS::Region}:${AWS::AccountId}:destination:VPCFlowLogDst\"}]}"
+
+
+  rVpcFlogLogPublishRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - vpc-flow-logs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LoadTargetLambdaFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: "*"
+                
+  rCalculatorLambdaExecRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CalculatorLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                  - s3:*
+                  - ec2:*
+                  - kinesis:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sts:Assume*
+                Resource: "*"
+  rCalculatorLambdaPermissions:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref rCalculatorLambda
+      Principal: "kinesis.amazonaws.com"
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt rReceiverKinesis.Arn
+      Action: "lambda:InvokeFunction"
+
+  rCalculatorLambdaEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref rCalculatorLambda
+      Enabled: True
+      EventSourceArn: !GetAtt rReceiverKinesis.Arn
+      StartingPosition: LATEST
+      BatchSize: 1
+      
+      
+  rCalculatorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.7
+      Role: !GetAtt rCalculatorLambdaExecRole.Arn
+      Handler: Calculator.lambda_handler
+      Environment: 
+        Variables:
+          CURRENT_ACCOUNT: !Ref AWS::AccountId
+          SPOKE_ACCOUNT_IDS: !If [cCrossAccount, !Ref pSpokeAccount, NoValue]
+          DDB_NAME: !Ref rDynamoDBTable
+      Code:
+        S3Bucket: !Ref pLambdaFunctionS3Buket
+        S3Key: Calculator.zip
+        
+Outputs:
+  oCWDestinationArn:
+    Value: !GetAtt rVpcFlowLogDst.Arn
+  oDDBRole:
+    Value: !GetAtt rDDBRole.Arn

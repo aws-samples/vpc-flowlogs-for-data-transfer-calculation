@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  pCTrailBucket:
+    Type: String
+    Description: The S3 bucket for your current CloudTrail. Leave empty if you want to create a new bucket
+  pLambdaFunctionS3Buket:
+    Type: String
+    Description: Provide the S3 bucket that stores your Lambda function codes
+  pCentralAccountRole:
+    Type: String
+    Description: Dynamo DB role ARN, this is obtained from ddb-role stack output for DDBRoleArn
+
+  pVpcID:
+    Type: List<AWS::EC2::VPC::Id>
+    Description: the VPC ID that you would like to create the Flowlogs 
+
+  pDestinationARN: 
+    Type: String
+    Description: Destination ARN in Hub account
+    
+Conditions:
+  cCreateCTrialBucket: !Equals [!Ref pCTrailBucket, ""]
+  cCrossAccount: !Not [!Equals [!Ref pCentralAccountRole, ""]]
+  
+Resources:
+  ############################################ 
+  ## Create Flowlogs and Log Group streaming##
+  ############################################
+  rVpcFlowLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 30
+      
+  rVpcFlowLogs:
+    UpdateReplacePolicy: Retain
+    Type: Custom::CreateFlowlog
+    Properties: 
+      ServiceToken: !GetAtt rCreatVPCFlowlogsLambda.Arn
+      VpcIds: !Ref pVpcID
+      LogGroupArn: !GetAtt rVpcFlowLogGroup.Arn
+      VpcFlogLogPublishRole: !GetAtt rVpcFlogLogPublishRole.Arn
+      
+  rCreatVPCFlowlogsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: CreateVpcFlowlogs.lambda_handler
+      Role: !GetAtt rCreatVPCFlowlogsLambdaExecRole.Arn
+      Code:
+        S3Bucket: !Ref pLambdaFunctionS3Buket
+        S3Key: CreateVpcFlowlogs.zip
+      Runtime: python3.7
+      Timeout: 150
+
+  rCreatVPCFlowlogsLambdaExecRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LoadTargetLambdaFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - iam:*
+                Resource: "*"
+                
+  rVpcFlogLogPublishRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - vpc-flow-logs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LoadTargetLambdaFunctionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: "*"
+                
+  rVpcFlowSubscriptionLogGroupToDst:
+    Type: "AWS::Logs::SubscriptionFilter"
+    Properties:
+      DestinationArn: !Ref pDestinationARN
+      LogGroupName: !Ref rVpcFlowLogGroup
+      FilterPattern: "[version, account_id, interface_id, srcaddr != \"-\", dstaddr != \"-\", srcport != \"-\", dstport != \"-\", protocol, packets, bytes, start, end, action, log_status]"
+ 
+  ###############################################################
+  ## Update DDB table Lambda Listen to CloudWatch + CloudTrail ##
+  ###############################################################
+  rUpdateDDbLambdaExecRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: UpdateIotPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                Resource: arn:aws:dynamodb:*
+              - Action: "sts:AssumeRole"
+                Effect: Allow
+                Resource: "*"
+
+  rUpdateDDBLambdaPermissions:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref rUpdateDDBLambda
+      Principal: "logs.amazonaws.com"
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt rCtrailLogGroup.Arn
+      Action: "lambda:InvokeFunction"
+
+  rUpdateDDBLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt rUpdateDDbLambdaExecRole.Arn
+      Environment: 
+        Variables:
+          CENTRAL_ACCOUNT_ROLE: !If [cCrossAccount, !Ref pCentralAccountRole, NoValue]
+      Code:
+        S3Bucket: !Ref pLambdaFunctionS3Buket
+        S3Key: UpdateDDBTable.zip
+      Runtime: python3.7
+      Timeout: 150
+      Handler: UpdateDDBTable.lambda_handler
+
+
+  rCtrailS3Bucket:
+    Condition: cCreateCTrialBucket
+    Type: AWS::S3::Bucket
+
+  rCtrailBucketPolicy:
+    Condition: cCreateCTrialBucket
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref rCtrailS3Bucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 's3:GetBucketAcl'
+            Effect: Allow
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref rCtrailS3Bucket
+            Principal: 
+              Service: cloudtrail.amazonaws.com
+          - Action:
+            - s3:PutObject
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref rCtrailS3Bucket
+                - /AWSLogs/
+                - !Ref AWS::AccountId
+                - "/*"
+            Condition:
+              StringEquals: 
+                's3:x-amz-acl': 'bucket-owner-full-control'
+  rCtrailRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudtrail.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: UpdateIotPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+
+  rCtrail: 
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      CloudWatchLogsLogGroupArn: !GetAtt rCtrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt rCtrailRole.Arn
+      S3BucketName: !If [cCreateCTrialBucket, !Ref rCtrailS3Bucket, !Ref pCTrailBucket]
+      IsLogging: true
+
+  rCtrailLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 30
+
+  rSubscriptionFilter: 
+    Type: AWS::Logs::SubscriptionFilter
+    Properties: 
+      LogGroupName: 
+        Ref: "rCtrailLogGroup"
+      FilterPattern: "CreateSubnet"
+      DestinationArn: !GetAtt rUpdateDDBLambda.Arn
+
+
+  #################################################
+  ## Load Target account subnet CIDR info to DDB ##
+  #################################################
+
+
+  rLoadDDBLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: LoadAZCidr.lambda_handler
+      Role: !GetAtt rInitDDBLambdaExecRole.Arn
+      Code:
+        S3Bucket: !Ref pLambdaFunctionS3Buket
+        S3Key: LoadAZCidr.zip
+      Runtime: python3.7
+      Timeout: 150
+      
+  rInitDDBLambdaExecRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: UpdateIotPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                  - ec2:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "*"
+                
+  rCustomResourceUpdateDDB:
+    Type: Custom::LoadDDBLambda
+    Properties:
+      ServiceToken: !GetAtt rLoadDDBLambda.Arn
+      CentralAccountRoles: !If [cCrossAccount, !Ref pCentralAccountRole, NoValue]

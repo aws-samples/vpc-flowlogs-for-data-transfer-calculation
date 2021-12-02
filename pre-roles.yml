@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  pCentralAccount:
+    Type: String
+    Description: Provide the hub account ID
+
+Resources:
+  rSpokeAccountExecRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      RoleName: DtazExecRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Ref pCentralAccount
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: Admin
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 
+            - '*'
+            Resource: "*"
+Outputs: 
+  oSpokeAccountExecRole: 
+    Value: !GetAtt rSpokeAccountExecRole.Arn
